@@ -162,15 +162,56 @@ RUN sed -i 's|http://archive.ubuntu.com|http://fr.archive.ubuntu.com|g' /etc/apt
     # OpenCL loader
     ocl-icd-libopencl1 \
     opencl-headers \
+    clinfo \
     \
-    # CPU OpenCL backend (fallback)
+    # GPU backends for hashcat, one per vendor family. The image is built once and
+    # runs on machines we do not control, so every backend ships and the entrypoint
+    # picks whichever the host actually exposes at runtime.
+    #   NVIDIA  -> CUDA comes from the base image; the driver libraries are mounted
+    #              by the container runtime, which needs NVIDIA_DRIVER_CAPABILITIES
+    #              (set below) plus `--gpus all` on the docker/compose side.
+    #   AMD     -> Mesa rusticl/clover: works through /dev/dri without the multi-GB
+    #              ROCm stack. Machines with full ROCm keep using it via /dev/kfd.
+    #   Intel   -> NEO compute runtime for Arc and recent integrated graphics.
+    #              intel-opencl-icd is x86-only, so it is installed conditionally
+    #              below (amd64 only) — arm64 / Apple Silicon builds skip it and
+    #              fall back to mesa + pocl instead of failing the apt step.
+    mesa-opencl-icd \
+    \
+    # CPU OpenCL backend (last-resort fallback, always present)
     pocl-opencl-icd \
     \
     # tools
-    clinfo \
     wget \
     xz-utils \
     p7zip-full \
+    zip \
+    unzip \
+    iputils-ping \
+    \
+    # database / cache clients (sql-databases & messaging-cache agents)
+    postgresql-client \
+    default-mysql-client \
+    redis-tools \
+    \
+    # offline cracking + wordlist gen (gcp/storage encrypted-archive chain)
+    cewl \
+    john \
+    libcompress-raw-lzma-perl \
+    \
+    # firmware / IoT analysis (firmware agent)
+    binwalk \
+    squashfs-tools \
+    sqlite3 \
+    arp-scan \
+    netcat-openbsd \
+    nfs-common \
+    file \
+    # Intel NEO OpenCL runtime is x86-only: install it only on amd64 so the
+    # build works natively on arm64 / Apple Silicon (fixes #44).
+ && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+      apt-get install -y --no-install-recommends intel-opencl-icd; \
+    fi \
  && rm -rf /var/lib/apt/lists/*
 
 # ------------------------------------------------------------
@@ -181,6 +222,41 @@ RUN wget https://hashcat.net/files/hashcat-6.2.6.7z \
  && mv hashcat-6.2.6 /opt/hashcat \
  && ln -sf /opt/hashcat/hashcat.bin /usr/local/bin/hashcat \
  && rm hashcat-6.2.6.7z
+
+# ------------------------------------------------------------
+# 7z2john for the GCS/storage encrypted-archive crack chain (7-Zip -> hashcat -m 11600)
+# ------------------------------------------------------------
+RUN wget -qO /usr/local/bin/7z2john.pl https://raw.githubusercontent.com/openwall/john/bleeding-jumbo/run/7z2john.pl \
+ && printf '#!/bin/sh\nexec perl /usr/local/bin/7z2john.pl "$@"\n' > /usr/local/bin/7z2john \
+ && chmod +x /usr/local/bin/7z2john /usr/local/bin/7z2john.pl
+
+# ------------------------------------------------------------
+# firmwalker — automated firmware filesystem secret hunter (firmware agent)
+# ------------------------------------------------------------
+RUN (git clone --depth 1 https://github.com/craigz28/firmwalker.git /opt/firmwalker \
+      || git clone --depth 1 https://github.com/hotelzululima/firmwalker.git /opt/firmwalker) \
+ && ln -sf /opt/firmwalker/firmwalker.sh /usr/local/bin/firmwalker \
+ && chmod +x /opt/firmwalker/firmwalker.sh \
+ || echo "[WARN] firmwalker unavailable (upstream craigz28 repo removed); continuing without it"
+# ------------------------------------------------------------
+# sasquatch — vendor-patched unsquashfs for the non-standard LZMA/XZ SquashFS
+# images shipped by embedded vendors (firmware agent).
+# Best-effort on purpose: firmware.md falls back to plain unsquashfs when it is
+# absent, so a dead mirror or a new arch must never break the whole image build.
+# ------------------------------------------------------------
+ARG SASQUATCH_TAG=sasquatch-v4.5.1-6
+RUN set -eux; \
+    ARCH="$(dpkg --print-architecture)"; \
+    URL="https://github.com/onekey-sec/sasquatch/releases/download/${SASQUATCH_TAG}/sasquatch_1.0_${ARCH}.deb"; \
+    if curl -fsSL --retry 2 --max-time 120 "$URL" -o /tmp/sasquatch.deb; then \
+      dpkg -i /tmp/sasquatch.deb || true; \
+      rm -f /tmp/sasquatch.deb; \
+    fi; \
+    if command -v sasquatch >/dev/null 2>&1; then \
+      echo "[OK] sasquatch installed"; \
+    else \
+      echo "[WARN] sasquatch unavailable for ${ARCH} - firmware agent will fall back to unsquashfs"; \
+    fi
 
 # ------------------------------------------------------------
 # Node.js + Playwright (stable project install)
@@ -195,6 +271,20 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && npm cache clean --force
 
 # ------------------------------------------------------------
+# Google Cloud SDK (gcp agent): gcloud + gsutil + bq via official tarball
+# az (Azure CLI) and aws are installed into /opt/darkmoon/python by setup_py.sh
+# ------------------------------------------------------------
+ARG GCLOUD_VERSION=490.0.0
+RUN curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-${GCLOUD_VERSION}-linux-x86_64.tar.gz" -o /tmp/gcloud.tgz \
+ && tar xzf /tmp/gcloud.tgz -C /opt \
+ && rm -f /tmp/gcloud.tgz \
+ && /opt/google-cloud-sdk/install.sh --quiet --usage-reporting false --path-update false --command-completion false \
+ && ln -sf /opt/google-cloud-sdk/bin/gcloud /usr/local/bin/gcloud \
+ && ln -sf /opt/google-cloud-sdk/bin/gsutil /usr/local/bin/gsutil \
+ && ln -sf /opt/google-cloud-sdk/bin/bq /usr/local/bin/bq \
+ && gcloud --version | head -1
+
+# ------------------------------------------------------------
 # Core artefacts copiés depuis builder
 # ------------------------------------------------------------
 COPY --from=builder /out /out
@@ -204,7 +294,7 @@ COPY --from=builder /opt/darkmoon /opt/darkmoon
 # Environment runtime
 # ------------------------------------------------------------
 ENV PATH="/opt/darkmoon/curl/bin:/opt/darkmoon/python/bin:/opt/darkmoon/ruby/bin:${PATH}" \
-    LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/opt/darkmoon/curl/lib:/opt/darkmoon/python/lib:/opt/darkmoon/ruby/lib"
+    LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu:/usr/lib/x86_64-linux-gnu:/opt/darkmoon/curl/lib:/opt/darkmoon/python/lib:/opt/darkmoon/ruby/lib"
 
 RUN ln -s /opt/darkmoon/python/bin/python3 /usr/local/bin/python \
  && ln -s /opt/darkmoon/python/bin/pip3 /usr/local/bin/pip
@@ -230,6 +320,13 @@ RUN curl -fsSL --max-redirs 5 \
  && ln -sf /usr/share/wordlists/rockyou.txt \
           /usr/share/seclists/Passwords/rockyou.txt \
  && echo "[OK] rockyou.txt $(wc -l < /usr/share/wordlists/rockyou.txt) lines"
+
+# The NVIDIA container runtime only mounts the driver libraries when these are
+# declared. Without them a container started with `--gpus all` still sees no GPU,
+# which is why hashcat silently fell back to CPU pthreads on every deployment.
+# Harmless on hosts with no NVIDIA GPU: the runtime simply ignores them.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 ENV SECLISTS=/usr/share/seclists \
     NUCLEI_TEMPLATES=${DM_HOME}/nuclei-templates

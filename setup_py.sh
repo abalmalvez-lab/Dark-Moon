@@ -224,6 +224,30 @@ msg "Installation arjun …"
 msg "Installation awscli …"
 "$PIP_BIN" install --no-cache-dir awscli && ok "awscli"
 
+msg "Installation azure-cli (Entra ID / Azure agents) …"
+"$PIP_BIN" install --no-cache-dir azure-cli && ok "azure-cli"
+
+# ------------------------------------------------------------
+# garak — LLM vulnerability scanner (llm agent). Non-blocking: a failure here
+# must not break the 20GB toolbox build; the llm agent degrades to its manual
+# curl/python methodology when garak is absent.
+# CPU torch first: garak scans a REMOTE endpoint, no GPU needed, so we avoid the
+# multi-GB CUDA torch the nvidia/cuda base image would otherwise pull.
+# ------------------------------------------------------------
+msg "Installation garak (LLM vulnerability scanner) …"
+"$PIP_BIN" install --no-cache-dir --prefer-binary torch --index-url https://download.pytorch.org/whl/cpu \
+  || warn "cpu torch install failed; garak may pull the default torch build"
+if "$PIP_BIN" install --no-cache-dir 'garak==0.16.0'; then
+  cat >"$BIN_OUT/garak" <<'EOF'
+#!/bin/sh
+exec /opt/darkmoon/python/bin/garak "$@"
+EOF
+  chmod +x "$BIN_OUT/garak"
+  ok "garak"
+else
+  warn "garak install failed (non-blocking) — llm agent will use its manual curl methodology"
+fi
+
 # ------------------------------------------------------------
 # FinalRecon (reconnaissance web) - Version pinnée
 # ------------------------------------------------------------
@@ -288,6 +312,12 @@ cat >"$BIN_OUT/aws" <<'EOF'
 exec /opt/darkmoon/python/bin/aws "$@"
 EOF
 chmod +x "$BIN_OUT/aws"
+
+cat >"$BIN_OUT/az" <<'EOF'
+#!/bin/sh
+exec /opt/darkmoon/python/bin/az "$@"
+EOF
+chmod +x "$BIN_OUT/az"
 
 cat >"$BIN_OUT/finalrecon" <<'EOF'
 #!/bin/sh

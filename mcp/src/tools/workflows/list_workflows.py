@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Union, get_type_hints
 
 from src.docker_client import DarkmoonDockerClient
+from src.privacy import CommandGateway, PrivacyVault
 from src.tools.workflows.base import BaseWorkflow
 
 
@@ -297,7 +298,11 @@ class WorkflowRegistry:
         self,
         workflow: str,
         method: str,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        privacy_gateway: Optional[CommandGateway] = None,
+        privacy_vault: Optional[PrivacyVault] = None,
+        enforce_exfil_policy: bool = True,
     ) -> Dict[str, Any]:
         """
         Execute a workflow method by name.
@@ -306,6 +311,10 @@ class WorkflowRegistry:
             workflow: Name of the workflow (e.g., "port_scan")
             method: Name of the method to call (e.g., "scan_ports")
             params: Parameters to pass to the method
+            privacy_gateway: Gateway for the workflow privacy boundary.
+            privacy_vault: Session vault for local placeholder resolution.
+            enforce_exfil_policy: Apply the positional exfiltration rules. Output
+                is sanitized either way.
 
         Returns:
             Result of the workflow execution
@@ -313,12 +322,22 @@ class WorkflowRegistry:
         Raises:
             ValueError: If workflow or method not found
         """
+        def finish(result: Dict[str, Any]) -> Dict[str, Any]:
+            # Output sanitization is never optional. Relaxing a session's
+            # exfiltration policy widens what the gateway will rehydrate into a
+            # command; it must not also start handing the model the real values
+            # it already holds placeholders for. This is the invariant the
+            # degrade policy leans on.
+            if privacy_gateway is None or privacy_vault is None:
+                return result
+            return privacy_gateway.sanitize_result(result, privacy_vault)
+
         if workflow not in self.workflows:
             available = list(self.workflows.keys())
-            return {
+            return finish({
                 "error": f"Workflow '{workflow}' not found",
                 "available_workflows": available,
-            }
+            })
 
         instance = self.workflows[workflow]
 
@@ -326,10 +345,10 @@ class WorkflowRegistry:
             available_methods = list(
                 self.workflow_metadata[workflow]["methods"].keys()
             )
-            return {
+            return finish({
                 "error": f"Method '{method}' not found in workflow '{workflow}'",
                 "available_methods": available_methods,
-            }
+            })
 
         workflow_method = getattr(instance, method)
         method_metadata = self.workflow_metadata[workflow]["methods"].get(method, {})
@@ -338,27 +357,44 @@ class WorkflowRegistry:
             # Convert parameters to expected types
             converted_params = self._convert_params(params or {}, method_metadata)
 
+            if privacy_gateway is not None and privacy_vault is not None:
+                privacy_result = privacy_gateway.process_tool_call(
+                    tool=f"{workflow}.{method}",
+                    args=converted_params,
+                    rehydrate_fields=tuple(converted_params),
+                    vault=privacy_vault,
+                    enforce_exfil_policy=enforce_exfil_policy,
+                )
+                if privacy_result.blocked:
+                    # Only reachable under DARKMOON_PRIVACY_POLICY=strict.
+                    return finish({
+                        "error": "Privacy gateway blocked workflow parameters",
+                        "privacy": "blocked",
+                        "reason": privacy_result.reason,
+                    })
+                converted_params = privacy_result.resolved or {}
+
             result = workflow_method(**converted_params)
-            return result
+            return finish(result)
         except ValueError as e:
             # Type conversion error
-            return {
+            return finish({
                 "error": f"Parameter conversion error: {str(e)}",
                 "expected_parameters": method_metadata.get("parameters", {}),
-            }
+            })
         except TypeError as e:
             # Parameter mismatch
-            return {
+            return finish({
                 "error": f"Parameter error: {str(e)}",
                 "expected_parameters": method_metadata.get("parameters", {}),
-            }
+            })
         except Exception as e:
             logger.exception(f"Workflow execution error: {workflow}.{method}")
-            return {
+            return finish({
                 "error": f"Execution error: {str(e)}",
                 "workflow": workflow,
                 "method": method,
-            }
+            })
 
     def get_workflow_info(self, workflow: str) -> Dict[str, Any]:
         """

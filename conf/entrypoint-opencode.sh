@@ -42,7 +42,8 @@ mkdir -p \
 log "Applying OpenCode configuration (forced)"
 
 log "Runtime environment variables available:"
-env | grep -E 'OPENROUTER_|OPENCODE_' || true
+# Redact secret values (anything whose name contains KEY/TOKEN/SECRET/PASSWORD)
+env | grep -E 'OPENROUTER_|OPENCODE_' | sed -E 's/^([^=]*(KEY|TOKEN|SECRET|PASSWORD)[^=]*)=.*/\1=REDACTED/I' || true
 
 [ -x "$APPLY_SCRIPT" ] || fatal "Apply script not executable: $APPLY_SCRIPT"
 
@@ -138,6 +139,40 @@ while read -r path; do
   log "Markdown detected → moving $src → $dst"
   mv -f "$src" "$dst"
 done &
+
+#######################################
+# Growth signals (local, privacy-first, opt-out)
+#######################################
+# Both the MCP server (writer, api/growth.py) and opencode + the growth CTA plugin
+# (reader/displayer) run in THIS container, so they share one growth state dir.
+# Pin it under the persisted opencode share (bind-mounted to ./darkmoon-settings)
+# so the "shown once" state survives container restarts. Exported before both the
+# MCP boot and opencode below, so both inherit it. Honours DARKMOON_NO_TELEMETRY.
+export DARKMOON_GROWTH_DIR="${DARKMOON_GROWTH_DIR:-/root/.local/share/opencode/.darkmoon-growth}"
+mkdir -p "$DARKMOON_GROWTH_DIR" 2>/dev/null || true
+
+#######################################
+# Persistent Darkmoon MCP (issue #40, section 3)
+#######################################
+# Start the darkmoon MCP as a persistent streamable-http server BEFORE opencode,
+# so its per-process vault AND the pre-model tokenization socket are up before any
+# session. opencode connects to it as a remote MCP (apply-settings.sh writes the
+# matching config), which lets the privacy plugin tokenize the launch prompt — and
+# the session-title call that precedes the first model turn — with no wait. Set
+# DARKMOON_MCP_TRANSPORT=stdio to fall back to per-session stdio spawning.
+if [ "${DARKMOON_MCP_TRANSPORT:-http}" != "stdio" ]; then
+  export DARKMOON_MCP_TRANSPORT="${DARKMOON_MCP_TRANSPORT:-http}"
+  export DARKMOON_MCP_HOST="${DARKMOON_MCP_HOST:-127.0.0.1}"
+  export DARKMOON_MCP_PORT="${DARKMOON_MCP_PORT:-8181}"
+  export DARKMOON_MCP_PATH="${DARKMOON_MCP_PATH:-/mcp}"
+  # Persistent MCP = one long-lived vault shared by every session; give it a long
+  # TTL so placeholders minted for a launch prompt still rehydrate into a report
+  # generated much later in a long campaign (the vault is in-memory and local-only,
+  # and resets on container restart).
+  export DARKMOON_PRIVACY_TTL="${DARKMOON_PRIVACY_TTL:-604800}"
+  log "Starting persistent Darkmoon MCP (http) on ${DARKMOON_MCP_HOST}:${DARKMOON_MCP_PORT}${DARKMOON_MCP_PATH}"
+  /usr/local/bin/darkmoon-mcp >/tmp/darkmoon-mcp-boot.log 2>&1 &
+fi
 
 #######################################
 # Start main process

@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import socket
 import docker
@@ -8,8 +9,18 @@ from docker.models.containers import Container
 from docker.errors import DockerException, NotFound
 
 from src.models.common import ExecutionResult, ExecutionStatus
+from src.execution_guard import adapt_command, classify, effective_timeout, remediation
 
 STREAM_BASE = "/tmp/darkmoon_mcp_stream"
+
+# Long-running scanners that routinely outlive the `timeout` wrapper: coreutils
+# signals its direct child (bash), and a grandchild started through a pipe can be
+# reparented and keep hammering the target long after the campaign moved on. Two
+# of these were still running 72 minutes after their campaign had frozen.
+_REAPABLE = (
+    "hydra", "medusa", "ncrack", "patator", "sqlmap", "ffuf", "dirb",
+    "gobuster", "feroxbuster", "wfuzz", "naabu", "masscan", "nuclei",
+)
 
 
 class DarkmoonDockerClient:
@@ -35,6 +46,7 @@ class DarkmoonDockerClient:
         # Ensure stream socket exists (server created by darkmoon-cli)
         # Client will just connect if available.
         self._stream_enabled = True
+        self._gpu_cache = None
 
     def _broadcast(self, b: bytes, session_id: str | None = None):
         if not self._stream_enabled:
@@ -86,12 +98,34 @@ class DarkmoonDockerClient:
         start_time = time.time()
 
         try:
-            # Prepare command
+            # Prepare command.
+            #
+            # Every command is wrapped in coreutils `timeout` INSIDE the container.
+            # The `timeout` argument used to be recorded in metadata and never
+            # enforced: the stream loop below blocks until the process exits, so a
+            # command that never ends (an unbounded `hydra -P rockyou.txt`, a `cat`
+            # on a socket that never sends EOF) froze the whole campaign — no more
+            # findings, no finalize, no report. Enforcing the deadline in the
+            # container means the process is killed even if the client goes away.
+            hard_timeout = effective_timeout(timeout)
+
+            # Route heavy offline cracking to the right component instead of
+            # refusing it. hashcat gets pinned to the GPU when the entrypoint found
+            # a usable one, and always gets `--runtime`, so a full dictionary run
+            # returns what it found inside the budget rather than holding the
+            # campaign for hours. Measured on an RTX 5060: 7.57 MH/s on GPU against
+            # 33.5 kH/s on CPU threads for md5crypt, a factor of 225.
+            if isinstance(command, str):
+                adapted, note = adapt_command(command, self._gpu_state(container))
+                if note:
+                    command = adapted
+                    self._broadcast(f"\n\033[1;33m[guard]\033[0m {note}\n".encode(), session_id)
+
             if isinstance(command, list):
-                cmd = command
+                cmd = ["timeout", "--kill-after=5", str(hard_timeout)] + command
                 cmd_str = " ".join(command)
             else:
-                cmd = ["bash", "-c", command]
+                cmd = ["timeout", "--kill-after=5", str(hard_timeout), "bash", "-c", command]
                 cmd_str = command
 
             # OPTIONAL: ignore health checks in the live stream (no spam)
@@ -135,6 +169,27 @@ class DarkmoonDockerClient:
             inspect = self.client.api.exec_inspect(exec_id)
             exit_code = inspect.get("ExitCode", 1)
 
+            # coreutils `timeout` reports 124 on expiry (137 when it had to SIGKILL).
+            # Hand the agent an actionable explanation instead of silence: a bare
+            # "timed out" makes a model retry the identical command, which is how a
+            # campaign burns an hour on the same dead end.
+            if exit_code in (124, 137):
+                self._reap_survivors(container, cmd_str)
+                return ExecutionResult(
+                    status=ExecutionStatus.TIMEOUT,
+                    stdout=stdout_acc,
+                    stderr=remediation(cmd_str, duration, hard_timeout),
+                    exit_code=exit_code,
+                    duration=duration,
+                    metadata={
+                        "command": cmd_str,
+                        "workdir": workdir,
+                        "timeout": hard_timeout,
+                        "timed_out": True,
+                        "guard": classify(cmd_str).label or "unclassified",
+                    },
+                )
+
             status = (
                 ExecutionStatus.SUCCESS
                 if exit_code == 0
@@ -150,7 +205,7 @@ class DarkmoonDockerClient:
                 metadata={
                     "command": cmd_str,
                     "workdir": workdir,
-                    "timeout": timeout,
+                    "timeout": hard_timeout,
                 },
             )
 
@@ -164,9 +219,90 @@ class DarkmoonDockerClient:
                 metadata={"command": str(command), "error": str(e)},
             )
 
+    def _gpu_state(self, container) -> Dict[str, str]:
+        """Read the GPU profile the toolbox entrypoint wrote at container start.
+
+        The file lives INSIDE the toolbox, not next to the MCP: reading it from the
+        local filesystem silently returned "no GPU" on every host and hashcat was
+        never pinned to the card. Cached for the process lifetime, since hardware
+        does not change under a running container.
+        """
+        if getattr(self, "_gpu_cache", None) is not None:
+            return self._gpu_cache
+
+        state = {"DM_GPU": "0", "DM_GPU_VENDOR": "unknown", "DM_HASHCAT_OPTS": ""}
+        try:
+            exec_id = self.client.api.exec_create(
+                container=container.id,
+                cmd=["bash", "-c", "cat /run/darkmoon-gpu.env 2>/dev/null || true"],
+            )["Id"]
+            raw = self.client.api.exec_start(exec_id).decode("utf-8", errors="ignore")
+            for line in raw.splitlines():
+                if "=" in line:
+                    k, _, v = line.strip().partition("=")
+                    state[k.strip()] = v.strip()
+        except Exception:
+            pass  # absent or unreadable: fall back to CPU assumptions, never crash
+
+        self._gpu_cache = state
+        return state
+
+    def _reap_survivors(self, container, cmd_str: str) -> None:
+        """Kill scanner grandchildren that outlived the `timeout` wrapper.
+
+        `timeout` signals the bash it started; a tool launched inside a pipeline
+        can survive that and keep running against the target indefinitely. Only
+        binaries from a fixed allow-list are reaped, and only when the command
+        that just expired actually mentions them, so this can never kill an
+        unrelated process.
+        """
+        targets = [t for t in _REAPABLE if re.search(rf"\b{t}\b", cmd_str or "")]
+        if not targets:
+            return
+        try:
+            for tool in targets:
+                self.client.api.exec_start(
+                    self.client.api.exec_create(
+                        container=container.id,
+                        cmd=["bash", "-c", f"pkill -9 -x {tool} 2>/dev/null || true"],
+                    )["Id"]
+                )
+        except Exception:
+            pass  # best effort: never let cleanup mask the timeout itself
+
     def check_tool_available(self, tool_name: str) -> bool:
         result = self.execute_command(f"which {tool_name}", timeout=5)
         return result.success
+
+    def check_tools_bulk(self, tools: List[str]) -> Dict[str, bool]:
+        """Probe many tools in ONE container round-trip.
+
+        The old health check ran one `docker exec which <tool>` per tool. At a
+        dozen tools that is a dozen round-trips of container-exec overhead on
+        every campaign start; over the full toolbox it would be a hundred. A
+        single `command -v` loop inside one exec returns the whole map at once,
+        so reporting the complete toolbox costs no more than probing four tools
+        did before. A tool name is validated to a safe charset so the joined
+        loop can never inject.
+        """
+        safe = [t for t in tools if re.fullmatch(r"[A-Za-z0-9_.+-]+", t or "")]
+        if not safe:
+            return {}
+        names = " ".join(safe)
+        script = (
+            'for t in ' + names + '; do '
+            'if command -v "$t" >/dev/null 2>&1; then echo "$t=1"; '
+            'else echo "$t=0"; fi; done'
+        )
+        result = self.execute_command(["bash", "-c", script], timeout=30)
+        status = {t: False for t in safe}
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if "=" in line:
+                name, _, val = line.partition("=")
+                if name in status:
+                    status[name] = val.strip() == "1"
+        return status
 
     def get_disk_usage(self) -> Optional[Dict[str, Any]]:
         """Get disk usage information from the container."""

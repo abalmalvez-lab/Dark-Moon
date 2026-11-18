@@ -2,6 +2,8 @@ import shlex
 from typing import Optional, Dict, List
 from src.docker_client import DarkmoonDockerClient
 from src.models.common import ToolOutput, ExecutionResult
+from src.execution_guard import classify
+from src.tools.core.allowlist import EXECUTOR_ALLOWED_TOOLS
 
 
 class GenericExecutor:
@@ -14,131 +16,7 @@ class GenericExecutor:
         self.docker_client = docker_client
 
         # Whitelist of allowed tools (for security)
-        self.allowed_tools = {
-            # Port scanners
-            "naabu",
-            "masscan",
-            # Web tools
-            "httpx",
-            "nuclei",
-            "ffuf",
-            "dirb",
-            "wafw00f",
-            "sqlmap",
-            "arjun",
-            "finalrecon",
-            "lightpanda",
-            "bash",
-            "cat",
-            "chmod",
-            "node",
-            "npm",
-            "npx",
-            "vulnx",
-	        "hydra",
-            "whatweb",
-            "cmseek",
-            "wpscan",
-            # Recon
-            "subfinder",
-            "waybackurls",
-            "katana",
-            # DNS
-            "dig",
-            "nslookup",
-            # Network
-            "curl",
-            "wget",
-            "ping",
-            # AD/Windows
-            "netexec",
-            "crackmapexec",
-            "bloodhound-python",
-            "hashcat",
-            "Get-GPPPassword.py",
-            "GetADComputers.py",
-            "GetADUsers.py",
-            "GetLAPSPassword.py",
-            "GetNPUsers.py",
-            "GetUserSPNs.py",
-            "ldapdomaindump",
-            "smbclient.py",
-            "smbexec.py",
-	    "smbserver.py",
-	    "findDelegation.py",
-            "addcomputer.py",
-	    "exchanger.py",
-	    "raiseChild.py",
-	    "rdp_check.py",
-	    "registry-read.py",
-	    "regsecrets.py",
-	    "rpcdump.py",
-	    "rpcmap.py",
-	    "ticketConverter.py",
-	    "ticketer.py",
-	    "tstool.py",
-	    "owneredit.py",
-	    "ping.py",
-	    "psexec.py",
-	    "sambaPipe.py",
-	    "samedit.py",
-	    "samrdump.py",
-	    "sniff.py",
-	    "sniffer.py",
-	    "secretsdump.py",
-	    "snmpwalk",
-	    "dcomexec.py",
-	    "dpapi.py",
-	    "filetime.py",
-	    "getArch.py",
-	    "getPac.py",
-	    "getST.py",
-	    "getTGT.py",
-	    "goldenPac.py",
-	    "jp.py",
-	    "keylistattack.py",
-	    "lookupsid.py",
-	    "mimikatz.py",
-	    "minikerberos-asreproast",
-	    "minikerberos-ccache2kirbi",
-	    "minikerberos-ccacheedit",
-	    "minikerberos-ccacheroast",
-	    "minikerberos-cve202233647",
-	    "minikerberos-cve202233679",
-	    "minikerberos-getNTPKInit",
-	    "minikerberos-getS4U2proxy",
-	    "minikerberos-getS4U2self",
-	    "minikerberos-getTGS",
-	    "minikerberos-getTGT",
-	    "minikerberos-kerb23hashdecrypt",
-	    "minikerberos-kerberoast",
-	    "minikerberos-keylist",
-	    "minikerberos-kirbi2ccache",
-	    "minikerberos-pw",
-	    "mqtt_check.py",
-	    "mssqlclient.py",
-	    "mssqlinstance.py",
-	    "wmiexec.py",
-	    "wmipersist.py",
-	    "wmiquery.py",
-	    "changepasswd.py",
-	    "badsuccessor.py",
-	    "net.py",
-	    "netview.py",
-	    "ntfs-read.py",
-	    "ntmlrelayx.py",
-            # Kubernetes
-            "kubectl",
-            "kubeletctl",
-            "kubescape",
-            # Misc
-            "jq",
-            "grep",
-            "awk",
-            "sed",
-	    "zip",
-	    "unzip",
-        }
+        self.allowed_tools = set(EXECUTOR_ALLOWED_TOOLS)
 
         # Dangerous commands to block
         self.blocked_patterns = [
@@ -164,6 +42,24 @@ class GenericExecutor:
         for pattern in self.blocked_patterns:
             if pattern in command:
                 return False, f"Blocked pattern detected: {pattern}"
+
+        # Refuse commands that provably cannot finish, BEFORE burning the deadline
+        # on them. The agent prompts already forbid unbounded credential attacks and
+        # giant wordlists, and a model still ran `hydra -P rockyou.txt` (14M
+        # candidates) and froze a whole campaign for 72 minutes. A rule that only
+        # lives in a prompt is a suggestion; this is the enforcement point.
+        # The refusal carries the same remediation the timeout path would give, so
+        # the agent can immediately reach its objective a bounded way instead of
+        # retrying the identical command.
+        verdict = classify(command)
+        if verdict.blocked:
+            return False, (
+                f"[REFUSED: {verdict.label}] This command cannot complete and would "
+                f"freeze the campaign.\n\nWHY: {verdict.why}\n\n"
+                f"DO THIS INSTEAD: {verdict.instead}\n\n"
+                "If two bounded attempts fail, record the vector as not-exploitable "
+                "and move on. Abandoning a dead end is a correct outcome."
+            )
 
         # Extract first word (tool name)
         try:

@@ -25,12 +25,18 @@ OPENCODE_LOCAL_PROVIDER_ID="${OPENCODE_LOCAL_PROVIDER_ID:-}"
 OPENCODE_LOCAL_PROVIDER_NAME="${OPENCODE_LOCAL_PROVIDER_NAME:-Local model}"
 OPENCODE_LOCAL_BASE_URL="${OPENCODE_LOCAL_BASE_URL:-}"
 OPENCODE_LOCAL_MODEL="${OPENCODE_LOCAL_MODEL:-}"
+OPENCODE_LOCAL_API_KEY="${OPENCODE_LOCAL_API_KEY:-}"
+
+# On-prem Anthropic-compatible vars (opencode reads ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY from env)
+ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}"
+ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-}"
 
 #######################################
 # Decide model strategy
-# Priority: local > cloud > fallback
+# Priority: local > anthropic > cloud > fallback
 #######################################
 USE_LOCAL=false
+USE_ANTHROPIC=false
 USE_OPENROUTER=false
 
 if [ "${OPENCODE_LOCAL_MODE}" = "true" ] && \
@@ -38,6 +44,8 @@ if [ "${OPENCODE_LOCAL_MODE}" = "true" ] && \
    [ -n "${OPENCODE_LOCAL_BASE_URL:-}" ] && \
    [ -n "${OPENCODE_LOCAL_MODEL:-}" ]; then
   USE_LOCAL=true
+elif [ -n "${ANTHROPIC_BASE_URL:-}" ] && [ -n "${ANTHROPIC_MODEL:-}" ]; then
+  USE_ANTHROPIC=true
 elif [ -n "${OPENROUTER_PROVIDER:-}" ] && \
      [ -n "${OPENROUTER_API_KEY:-}" ] && \
      [ -n "${OPENCODE_MODEL:-}" ]; then
@@ -49,6 +57,19 @@ if [ "$USE_LOCAL" = true ]; then
   FINAL_MODEL="${OPENCODE_LOCAL_PROVIDER_ID}/${OPENCODE_LOCAL_MODEL}"
   log "Using local provider: ${OPENCODE_LOCAL_PROVIDER_NAME} → model: ${FINAL_MODEL}"
   log "Base URL: ${OPENCODE_LOCAL_BASE_URL}"
+  # Cache-health guard: an openai-compatible local provider pointed at an Anthropic
+  # endpoint silently disables prompt caching (the cache_control marker is sent in
+  # OpenAI form, which Anthropic's OpenAI-compat endpoint ignores -> up to 50-90%
+  # higher input cost). Warn and point at the native-provider fix.
+  case "${OPENCODE_LOCAL_BASE_URL}" in
+    *anthropic*)
+      log "WARNING: local provider targets an Anthropic endpoint via the OpenAI-compatible SDK -- Anthropic prompt caching is DISABLED. For caching, use the native anthropic provider: set OPENCODE_LOCAL_MODE=false + ANTHROPIC_BASE_URL + ANTHROPIC_MODEL." ;;
+  esac
+elif [ "$USE_ANTHROPIC" = true ]; then
+  # On-prem Anthropic-compatible: opencode routes via ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY (env)
+  FINAL_MODEL="anthropic/${ANTHROPIC_MODEL}"
+  log "Using on-prem Anthropic-compatible endpoint → model: ${FINAL_MODEL}"
+  log "Base URL: ${ANTHROPIC_BASE_URL}"
 elif [ "$USE_OPENROUTER" = true ]; then
   FINAL_MODEL="$OPENROUTER_PROVIDER/$OPENCODE_MODEL"
   log "Using cloud provider: $FINAL_MODEL"
@@ -66,10 +87,21 @@ mkdir -p "$OPENCODE_CONFIG_DIR" "$OPENCODE_AUTH_DIR"
 # Write opencode.json (ALWAYS)
 #######################################
 
-# Build optional provider block for local mode
-LOCAL_PROVIDER_BLOCK=""
+# Build optional provider block.
+# - local mode  : declares a full OpenAI-compatible provider.
+# - anthropic   : registers the custom model id under the built-in "anthropic"
+#                 provider, otherwise opencode validates the configured model
+#                 against its hard-coded catalogue and rejects it with
+#                 ProviderModelNotFoundError.
+PROVIDER_BLOCK=""
 if [ "$USE_LOCAL" = true ]; then
-  LOCAL_PROVIDER_BLOCK=$(cat <<PROVEOF
+  # Optional API key for authenticated OpenAI-compatible endpoints (Bearer auth).
+  # JSON-escaped via python3 so keys containing quotes/backslashes can't break the config.
+  LOCAL_API_KEY_OPTION=""
+  if [ -n "${OPENCODE_LOCAL_API_KEY:-}" ]; then
+    LOCAL_API_KEY_OPTION=$(OPENCODE_LOCAL_API_KEY="$OPENCODE_LOCAL_API_KEY" python3 -c 'import json,os; print(",\n        \"apiKey\": " + json.dumps(os.environ["OPENCODE_LOCAL_API_KEY"]))')
+  fi
+  PROVIDER_BLOCK=$(cat <<PROVEOF
 ,
 
   "provider": {
@@ -77,7 +109,7 @@ if [ "$USE_LOCAL" = true ]; then
       "npm": "@ai-sdk/openai-compatible",
       "name": "${OPENCODE_LOCAL_PROVIDER_NAME}",
       "options": {
-        "baseURL": "${OPENCODE_LOCAL_BASE_URL}"
+        "baseURL": "${OPENCODE_LOCAL_BASE_URL}"${LOCAL_API_KEY_OPTION}
       },
       "models": {
         "${OPENCODE_LOCAL_MODEL}": {
@@ -88,20 +120,47 @@ if [ "$USE_LOCAL" = true ]; then
   }
 PROVEOF
 )
+elif [ "$USE_ANTHROPIC" = true ]; then
+  PROVIDER_BLOCK=$(cat <<PROVEOF
+,
+
+  "provider": {
+    "anthropic": {
+      "models": {
+        "${ANTHROPIC_MODEL}": {
+          "name": "${ANTHROPIC_MODEL}"
+        }
+      }
+    }
+  }
+PROVEOF
+)
+fi
+
+# Darkmoon MCP wiring (issue #40, section 3). By default the MCP runs as a
+# PERSISTENT streamable-http server started at boot (entrypoint), so opencode
+# connects to it as a remote MCP and the privacy plugin can reach its vault
+# before the first prompt. DARKMOON_MCP_TRANSPORT=stdio keeps the old per-session
+# local spawn.
+if [ "${DARKMOON_MCP_TRANSPORT:-http}" = "stdio" ]; then
+  MCP_DARKMOON='"darkmoon": { "type": "local", "command": ["/usr/local/bin/darkmoon-mcp"], "timeout": 36000000, "enabled": true }'
+else
+  _DM_MCP_URL="http://${DARKMOON_MCP_HOST:-127.0.0.1}:${DARKMOON_MCP_PORT:-8181}${DARKMOON_MCP_PATH:-/mcp}"
+  MCP_DARKMOON="\"darkmoon\": { \"type\": \"remote\", \"url\": \"${_DM_MCP_URL}\", \"enabled\": true }"
 fi
 
 cat > "$OPENCODE_CONFIG_FILE" <<EOF
 {
-  "\$schema": "https://opencode.ai/config.json"${LOCAL_PROVIDER_BLOCK},
+  "\$schema": "https://opencode.ai/config.json"${PROVIDER_BLOCK},
+
+  "model": "$FINAL_MODEL",
+  "small_model": "$FINAL_MODEL",
 
   "mcp": {
-    "darkmoon": {
-      "type": "local",
-      "command": ["/usr/local/bin/darkmoon-mcp"],
-      "timeout": 36000000,
-      "enabled": true
-    }
+    ${MCP_DARKMOON}
   },
+
+  "plugin": ["file:///opt/darkmoon/plugins/darkmoon-privacy.ts", "file:///opt/darkmoon/plugins/darkmoon-growth-cta.ts"],
 
   "permission": { "*": "allow" },
 
@@ -111,6 +170,209 @@ cat > "$OPENCODE_CONFIG_FILE" <<EOF
       "mcp": ["darkmoon"],
       "primary": true,
       "prompt_file": "/root/.opencode/agents/pentest.md"
+    },
+
+    "aws": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/aws.md"
+    },
+    "azure": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/azure.md"
+    },
+    "entra-id": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/entra-id.md"
+    },
+    "gcp": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/gcp.md"
+    },
+    "github": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/github.md"
+    },
+    "gitlab": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/gitlab.md"
+    },
+    "jenkins": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/jenkins.md"
+    },
+    "terraform": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/terraform.md"
+    },
+    "ansible": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/ansible.md"
+    },
+    "docker": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/docker.md"
+    },
+    "container-registry": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/container-registry.md"
+    },
+    "hashicorp-vault": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/hashicorp-vault.md"
+    },
+    "sql-databases": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/sql-databases.md"
+    },
+    "messaging-cache": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/messaging-cache.md"
+    },
+    "firmware": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/firmware.md"
+    },
+
+    "sso-idp": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/sso-idp.md"
+    },
+
+    "gitops": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/gitops.md"
+    },
+
+    "observability": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/observability.md"
+    },
+
+    "storage": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/storage.md"
+    },
+
+    "edge-proxy": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/edge-proxy.md"
+    },
+
+    "vpn-remote-access": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/vpn-remote-access.md"
+    },
+
+    "firewall-network": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/firewall-network.md"
+    },
+
+    "email-infrastructure": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/email-infrastructure.md"
+    },
+
+    "backup": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/backup.md"
+    },
+
+    "pki-adcs": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/pki-adcs.md"
+    },
+
+    "nosql-databases": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/nosql-databases.md"
+    },
+
+    "container-platform": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/container-platform.md"
+    },
+
+    "hypervisor": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/hypervisor.md"
+    },
+
+    "business-platforms": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/business-platforms.md"
+    },
+
+    "mobile": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/mobile.md"
+    },
+
+    "mdm": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/mdm.md"
     },
 
     "active-directory": {
@@ -139,6 +401,20 @@ cat > "$OPENCODE_CONFIG_FILE" <<EOF
       "mcp": ["darkmoon"],
       "secondary": true,
       "prompt_file": "/root/.opencode/agents/graphql.md"
+    },
+
+    "llm": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/llm.md"
+    },
+
+    "golang": {
+      "model": "$FINAL_MODEL",
+      "mcp": ["darkmoon"],
+      "secondary": true,
+      "prompt_file": "/root/.opencode/agents/golang.md"
     },
 
     "headless-browser": {
